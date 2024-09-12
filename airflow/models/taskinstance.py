@@ -2818,8 +2818,6 @@ class TaskInstance(Base, LoggingMixin):
         if test_mode:
             return
 
-        from airflow.models.dagrun import DagRun  # Avoid circular import
-
         self.refresh_from_db(session)
 
         if TYPE_CHECKING:
@@ -2827,16 +2825,6 @@ class TaskInstance(Base, LoggingMixin):
 
         self.end_date = timezone.utcnow()
         self.set_duration()
-
-        # Lock DAG run to be sure not to get into a deadlock situation when trying to insert
-        # TaskReschedule which apparently also creates lock on corresponding DagRun entity
-        with_row_locks(
-            session.query(DagRun).filter_by(
-                dag_id=self.dag_id,
-                run_id=self.run_id,
-            ),
-            session=session,
-        ).one()
 
         # Log reschedule request
         session.add(
