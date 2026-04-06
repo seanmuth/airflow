@@ -257,21 +257,67 @@ class TaskMap(TaskInstanceDependencies):
                 )
             )
 
-        for index in indexes_to_map:
-            # TODO: Make more efficient with bulk_insert_mappings/bulk_save_mappings.
-            ti = TaskInstance(
-                task,
-                run_id=run_id,
-                map_index=index,
-                state=state,
-                dag_version_id=dag_version_id,
-            )
-            task.log.debug("Expanding TIs upserted %s", ti)
-            task_instance_mutation_hook(ti)
-            ti = session.merge(ti)
-            ti.context_carrier = new_task_run_carrier(dr.context_carrier)
-            ti.refresh_from_task(task)  # session.merge() loses task information.
-            all_expanded_tis.append(ti)
+        # Bulk-insert new mapped TIs rather than merging one at a time.
+        # Two paths: when the mutation hook is a no-op we can build raw dicts
+        # and use bulk_insert_mappings (fastest); otherwise we need real ORM
+        # objects so the hook can inspect/mutate them, then bulk_save_objects.
+        if indexes_to_map:
+            indexes_list = list(indexes_to_map)  # materialise once; used in .in_() below
+            hook_is_noop: bool = task_instance_mutation_hook.is_noop  # type: ignore[attr-defined]
+
+            if hook_is_noop:
+                import uuid6
+
+                mappings = [
+                    {
+                        **TaskInstance.insert_mapping(
+                            run_id=run_id,
+                            task=task,
+                            map_index=index,
+                            dag_version_id=dag_version_id,
+                            dag_run=dr,
+                        ),
+                        "id": uuid6.uuid7(),
+                        "state": state,
+                    }
+                    for index in indexes_list
+                ]
+                task.log.debug("Bulk-inserting %d new mapped TI(s) for %s", len(mappings), task)
+                session.bulk_insert_mappings(TaskInstance.__mapper__, mappings)
+                session.flush()
+                # Re-fetch into the session identity map so callers get tracked objects.
+                fetched = session.scalars(
+                    select(TaskInstance)
+                    .where(
+                        TaskInstance.dag_id == task.dag_id,
+                        TaskInstance.task_id == task.task_id,
+                        TaskInstance.run_id == run_id,
+                        TaskInstance.map_index.in_(indexes_list),
+                    )
+                    .order_by(TaskInstance.map_index)
+                ).all()
+                for ti in fetched:
+                    ti.refresh_from_task(task)
+                all_expanded_tis.extend(fetched)
+            else:
+                # Mutation hook present — build ORM objects so the hook can
+                # inspect and mutate them, then persist everything in one shot.
+                new_tis: list[TaskInstance] = []
+                for index in indexes_list:
+                    ti = TaskInstance(
+                        task,
+                        run_id=run_id,
+                        map_index=index,
+                        state=state,
+                        dag_version_id=dag_version_id,
+                    )
+                    task.log.debug("Expanding TIs upserted %s", ti)
+                    task_instance_mutation_hook(ti)
+                    ti.context_carrier = new_task_run_carrier(dr.context_carrier)
+                    new_tis.append(ti)
+                session.bulk_save_objects(new_tis)
+                session.flush()
+                all_expanded_tis.extend(new_tis)
 
         # Coerce the None case to 0 -- these two are almost treated identically,
         # except the unmapped ti (if exists) is marked to different states.
