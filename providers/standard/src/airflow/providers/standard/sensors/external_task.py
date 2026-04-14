@@ -17,13 +17,13 @@
 from __future__ import annotations
 
 import datetime
-import os
 import typing
 import warnings
 from collections.abc import Callable, Collection, Iterable, Sequence
 from typing import TYPE_CHECKING, ClassVar
 
 from airflow.models.dag import DagModel
+from airflow.models.serialized_dag import SerializedDagModel
 from airflow.providers.common.compat.sdk import (
     AirflowSkipException,
     BaseOperatorLink,
@@ -48,16 +48,15 @@ from airflow.providers.standard.version_compat import (
     AIRFLOW_V_3_2_PLUS,
     BaseOperator,
 )
-from airflow.utils.file import correct_maybe_zipped
 from airflow.utils.state import State, TaskInstanceState
 
 if not AIRFLOW_V_3_0_PLUS:
     from airflow.utils.session import NEW_SESSION, provide_session
 
 if AIRFLOW_V_3_2_PLUS:
-    from airflow.dag_processing.dagbag import DagBag
+    pass
 else:
-    from airflow.models.dagbag import DagBag  # type: ignore[attr-defined, no-redef]
+    pass  # type: ignore[attr-defined, no-redef]
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -485,7 +484,35 @@ class ExternalTaskSensor(BaseSensorOperator):
                 )
 
     def execute_complete(self, context: Context, event: dict[str, typing.Any] | None = None) -> None:
-        """Execute when the trigger fires - return immediately."""
+        """
+        Execute when the trigger fires - return immediately.
+
+        IMPORTANT: ``_check_for_existence`` must NOT be called here, directly or indirectly.
+
+        The existence check performs a full ``DagBag`` load of the sensed DAG file, which can
+        block for many seconds on large DAGs.  Calling it during resume creates a window where:
+
+        1. The Celery worker is still executing (state = ``running``) while the DagBag loads.
+        2. The trigger evaluates immediately (the external task already succeeded), fires
+           ``TriggerEvent``, and the scheduler transitions the task ``deferred → queued``.
+        3. The scheduler finds the task ``running`` and retries the queue transition up to
+           5 times (~13 s), then gives up and leaves it in ``queued``.
+        4. When the worker finally finishes, Celery reports ``success`` but the DB state is
+           ``queued`` → state mismatch error.
+
+        The check belongs only in the *initial* ``execute()`` call, before the first ``defer()``.
+        Setting ``_has_checked_existence = True`` here ensures that even if a subclass or
+        the non-deferrable poke path (``_poke_af2``) is reached unexpectedly after resume,
+        the costly DagBag load will not be re-triggered.
+
+        TODO: replace the ``DagBag``-based task/task-group existence check in
+        ``_check_for_existence`` with a ``SerializedDagModel`` lookup so the check is fast
+        enough to be safe in the ``execute()`` hot path as well.
+        """
+        # Defensive guard: mark existence as already checked so that _poke_af2 (called by
+        # the non-deferrable poke path) never re-triggers _check_for_existence on this instance.
+        self._has_checked_existence = True
+
         if event is None:
             raise ExternalTaskNotFoundError("No event received from trigger")
 
@@ -514,33 +541,46 @@ class ExternalTaskSensor(BaseSensorOperator):
         if not dag_to_wait:
             raise ExternalDagNotFoundError(f"The external DAG {self.external_dag_id} does not exist.")
 
-        path = correct_maybe_zipped(dag_to_wait.fileloc)
-        if not path or not os.path.exists(path):
-            raise ExternalDagDeletedError(f"The external DAG {self.external_dag_id} was deleted.")
-
-        if self.external_task_ids:
-            refreshed_dag_info = DagBag(dag_to_wait.fileloc).get_dag(self.external_dag_id)
-            if not refreshed_dag_info:
-                raise ExternalDagNotFoundError(
-                    f"The external DAG {self.external_dag_id} could not be loaded."
+        # Check staleness via the scheduler-maintained DB flag rather than a filesystem stat.
+        # This avoids blocking I/O and is kept consistent by the scheduler on every parse cycle.
+        # Airflow 3.x: DagModel.is_stale is True when the scheduler detects the file is gone.
+        # Airflow 2.x: DagModel.is_active is False (inverse).
+        if AIRFLOW_V_3_0_PLUS:
+            if dag_to_wait.is_stale:
+                raise ExternalDagDeletedError(
+                    f"The external DAG {self.external_dag_id} is marked stale in the dag table; "
+                    "the scheduler has detected the DAG file was removed."
                 )
-            for external_task_id in self.external_task_ids:
-                if not refreshed_dag_info.has_task(external_task_id):
-                    raise ExternalTaskNotFoundError(
-                        f"The external task {external_task_id} in DAG {self.external_dag_id} does not exist."
+        else:
+            if not dag_to_wait.is_active:
+                raise ExternalDagDeletedError(
+                    f"The external DAG {self.external_dag_id} is marked inactive in the dag table; "
+                    "the scheduler has detected the DAG file was removed."
+                )
+
+        if self.external_task_ids or self.external_task_group_id:
+            # Use the serialized (DB-only) DAG representation instead of DagBag to avoid
+            # a blocking file parse that can cause scheduler state-mismatch under deferral.
+            serialized_dag = SerializedDagModel.get_dag(self.external_dag_id, session=session)
+            if not serialized_dag:
+                raise ExternalDagNotFoundError(
+                    f"The external DAG {self.external_dag_id} was not found in the serialized_dag table; "
+                    "ensure the DAG has been parsed and serialized by the scheduler."
+                )
+
+            if self.external_task_ids:
+                for external_task_id in self.external_task_ids:
+                    if not serialized_dag.has_task(external_task_id):
+                        raise ExternalTaskNotFoundError(
+                            f"The external task {external_task_id} in DAG {self.external_dag_id} does not exist."
+                        )
+
+            if self.external_task_group_id:
+                if self.external_task_group_id not in serialized_dag.task_group_dict:
+                    raise ExternalTaskGroupNotFoundError(
+                        f"The external task group '{self.external_task_group_id}' in "
+                        f"DAG '{self.external_dag_id}' does not exist."
                     )
-
-        if self.external_task_group_id:
-            refreshed_dag_info = DagBag(dag_to_wait.fileloc).get_dag(self.external_dag_id)
-            if not refreshed_dag_info:
-                raise ExternalDagNotFoundError(
-                    f"The external DAG {self.external_dag_id} could not be loaded."
-                )
-            if not refreshed_dag_info.has_task_group(self.external_task_group_id):
-                raise ExternalTaskGroupNotFoundError(
-                    f"The external task group '{self.external_task_group_id}' in "
-                    f"DAG '{self.external_dag_id}' does not exist."
-                )
 
         self._has_checked_existence = True
 
