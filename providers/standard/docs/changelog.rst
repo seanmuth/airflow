@@ -35,6 +35,14 @@
 Changelog
 ---------
 
+1.12.4
+......
+
+Bug Fixes
+~~~~~~~~~
+
+* ``Fix ExternalTaskSensor deferrable race condition: replace blocking DagBag load in _check_for_existence with SerializedDagModel DB lookup to prevent scheduler state mismatch on deferral resume``
+
 1.12.3
 ......
 

@@ -12,7 +12,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-04-09T13:52:05.078466942Z"
+exclude-newer = "2026-04-10T20:10:10.33391975Z"
 exclude-newer-span = "P4D"
 
 [options.exclude-newer-package]
@@ -92,9 +92,9 @@ apache-airflow-providers-mongo = false
 apache-airflow-providers-apprise = false
 apache-airflow-providers-apache-impala = false
 apache-airflow-ctl = false
-apache-airflow-providers-zendesk = false
 apache-airflow-providers-github = false
 apache-airflow-providers-snowflake = false
+apache-airflow-providers-zendesk = false
 apache-airflow-providers-presto = false
 apache-airflow-providers-airbyte = false
 apache-airflow-providers-apache-hive = false
@@ -7222,7 +7222,7 @@ docs = [{ name = "apache-airflow-devel-common", extras = ["docs"], editable = "d
 
 [[package]]
 name = "apache-airflow-providers-standard"
-version = "1.12.3"
+version = "1.12.4"
 source = { editable = "providers/standard" }
 dependencies = [
     { name = "apache-airflow" },
