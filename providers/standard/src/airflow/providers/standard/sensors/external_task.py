@@ -45,18 +45,12 @@ from airflow.providers.standard.triggers.external_task import WorkflowTrigger
 from airflow.providers.standard.utils.sensor_helper import _get_count, _get_external_task_group_task_ids
 from airflow.providers.standard.version_compat import (
     AIRFLOW_V_3_0_PLUS,
-    AIRFLOW_V_3_2_PLUS,
     BaseOperator,
 )
 from airflow.utils.state import State, TaskInstanceState
 
 if not AIRFLOW_V_3_0_PLUS:
     from airflow.utils.session import NEW_SESSION, provide_session
-
-if AIRFLOW_V_3_2_PLUS:
-    pass
-else:
-    pass  # type: ignore[attr-defined, no-redef]
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
